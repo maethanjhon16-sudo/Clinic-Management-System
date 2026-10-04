@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: clinic-student-service
+    runtime: python
+    rootDir: services/student
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: DATABASE_URL
+        sync: false
+
+  - type: web
+    name: clinic-gateway
+    runtime: python
+    rootDir: gateway
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: STUDENT_SERVICE_URL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
