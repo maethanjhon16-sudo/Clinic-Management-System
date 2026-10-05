@@ -16,14 +16,17 @@ log = logging.getLogger("gateway")
 # Add a line here as each new service is deployed.
 ROUTES = {
     "students": "STUDENT_SERVICE_URL",
+    "appointments": "APPOINTMENT_SERVICE_URL",
+    "doctors": "APPOINTMENT_SERVICE_URL",
 }
 SERVICES = {name: os.environ.get(env, "").rstrip("/") for name, env in ROUTES.items()}
 
 # Free hosts put idle services to sleep (about 1 minute to wake), so wait long enough.
 TIMEOUT = httpx.Timeout(90.0, connect=90.0)
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 4
+WAKING_STATUSES = {502, 503, 504}  # what a sleeping free service often returns while it starts
 IDEMPOTENT = {"GET", "HEAD", "PUT", "DELETE", "OPTIONS"}
-SKIP_HEADERS = {"host", "content-length", "connection", "keep-alive", "transfer-encoding",
+SKIP_HEADERS = {"host", "content-length", "accept-encoding", "connection", "keep-alive", "transfer-encoding",
                 "upgrade", "te", "trailer", "proxy-authorization", "proxy-authenticate"}
 
 
@@ -45,7 +48,7 @@ def error(status: int, code: str, message: str, details=None) -> JSONResponse:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "gateway"}
+    return {"status": "ok", "service": "gateway", "version": "1.1.1"}
 
 
 @app.get("/warmup")
@@ -60,8 +63,18 @@ async def warmup(request: Request):
         except httpx.HTTPError as exc:
             return name, f"unreachable ({type(exc).__name__})"
 
-    results = await asyncio.gather(*(ping(n, b) for n, b in SERVICES.items()))
-    return dict(results)
+    groups: dict[str, list[str]] = {}
+    for name, base in SERVICES.items():
+        groups.setdefault(base, []).append(name)
+
+    async def ping_group(base: str, names: list[str]):
+        _, status = await ping(names[0], base)
+        return {n: status for n in names}
+
+    merged: dict[str, str] = {}
+    for result in await asyncio.gather(*(ping_group(b, ns) for b, ns in groups.items())):
+        merged.update(result)
+    return merged
 
 
 @app.api_route("/api/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
@@ -77,6 +90,7 @@ async def proxy(full_path: str, request: Request):
     url = f"{base}/{full_path}"
     headers = {k: v for k, v in request.headers.items() if k.lower() not in SKIP_HEADERS}
     headers["x-request-id"] = request_id
+    headers["accept-encoding"] = "identity"  # ask upstream for plain bytes so we never relay compressed data
     body = await request.body()
 
     # Only retry when the request was certainly not processed, unless the method is idempotent.
@@ -91,6 +105,10 @@ async def proxy(full_path: str, request: Request):
                 request.method, url, params=request.query_params, headers=headers, content=body
             )
             log.info("%s %s %s -> %s (attempt %d)", request_id, request.method, url, upstream.status_code, attempt)
+            if (upstream.status_code in WAKING_STATUSES and request.method in IDEMPOTENT
+                    and attempt < MAX_ATTEMPTS):
+                await asyncio.sleep(6 * attempt)
+                continue
             out_headers = {"x-request-id": request_id}
             return Response(content=upstream.content, status_code=upstream.status_code,
                             media_type=upstream.headers.get("content-type"), headers=out_headers)
