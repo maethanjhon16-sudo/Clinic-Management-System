@@ -14,6 +14,39 @@ services:
         sync: false
 
   - type: web
+    name: clinic-appointments-service
+    runtime: python
+    rootDir: services/appointments
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: DATABASE_URL
+        sync: false
+      - key: STUDENT_SERVICE_URL
+        sync: false
+
+  - type: web
+    name: clinic-consultation-service
+    runtime: python
+    rootDir: services/consultation
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: DATABASE_URL
+        sync: false
+      - key: APPOINTMENT_SERVICE_URL
+        sync: false
+      # Add PHARMACY_SERVICE_URL and EXCUSE_SERVICE_URL once those services exist.
+
+  - type: web
     name: clinic-gateway
     runtime: python
     rootDir: gateway
@@ -25,6 +58,10 @@ services:
       - key: PYTHON_VERSION
         value: 3.12.3
       - key: STUDENT_SERVICE_URL
+        sync: false
+      - key: APPOINTMENT_SERVICE_URL
+        sync: false
+      - key: CONSULTATION_SERVICE_URL
         sync: false
       - key: ALLOWED_ORIGINS
         sync: false

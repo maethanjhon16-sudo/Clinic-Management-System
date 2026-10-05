@@ -18,6 +18,7 @@ ROUTES = {
     "students": "STUDENT_SERVICE_URL",
     "appointments": "APPOINTMENT_SERVICE_URL",
     "doctors": "APPOINTMENT_SERVICE_URL",
+    "consultations": "CONSULTATION_SERVICE_URL",
 }
 SERVICES = {name: os.environ.get(env, "").rstrip("/") for name, env in ROUTES.items()}
 
@@ -48,7 +49,7 @@ def error(status: int, code: str, message: str, details=None) -> JSONResponse:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "gateway", "version": "1.1.1"}
+    return {"status": "ok", "service": "gateway", "version": "1.2.0"}
 
 
 @app.get("/warmup")
