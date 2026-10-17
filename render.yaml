@@ -28,6 +28,8 @@ services:
         sync: false
       - key: STUDENT_SERVICE_URL
         sync: false
+      - key: NOTIFICATION_SERVICE_URL
+        sync: false
 
   - type: web
     name: clinic-consultation-service
@@ -44,7 +46,60 @@ services:
         sync: false
       - key: APPOINTMENT_SERVICE_URL
         sync: false
-      # Add PHARMACY_SERVICE_URL and EXCUSE_SERVICE_URL once those services exist.
+      - key: PHARMACY_SERVICE_URL
+        sync: false
+      - key: EXCUSE_SERVICE_URL
+        sync: false
+
+  - type: web
+    name: clinic-pharmacy-service
+    runtime: python
+    rootDir: services/pharmacy
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: DATABASE_URL
+        sync: false
+
+  - type: web
+    name: clinic-excuse-service
+    runtime: python
+    rootDir: services/excuse
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: DATABASE_URL
+        sync: false
+      - key: EXCUSE_SIGNING_SECRET
+        sync: false
+      - key: STUDENT_SERVICE_URL
+        sync: false
+      - key: NOTIFICATION_SERVICE_URL
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+
+  - type: web
+    name: clinic-notification-service
+    runtime: python
+    rootDir: services/notification
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: DATABASE_URL
+        sync: false
 
   - type: web
     name: clinic-gateway
@@ -62,6 +117,20 @@ services:
       - key: APPOINTMENT_SERVICE_URL
         sync: false
       - key: CONSULTATION_SERVICE_URL
+        sync: false
+      - key: PHARMACY_SERVICE_URL
+        sync: false
+      - key: EXCUSE_SERVICE_URL
+        sync: false
+      - key: NOTIFICATION_SERVICE_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
         sync: false
       - key: ALLOWED_ORIGINS
         sync: false

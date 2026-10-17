@@ -135,3 +135,36 @@ create table if not exists consultation.integration_events (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+alter table pharmacy.dispensing_records add column if not exists consultation_id uuid;
+alter table pharmacy.dispensing_records add column if not exists student_id uuid;
+alter table pharmacy.dispensing_records add column if not exists updated_at timestamptz not null default now();
+
+alter table pharmacy.dispensing_records drop constraint if exists dispensing_records_status_check;
+alter table pharmacy.dispensing_records add constraint dispensing_records_status_check
+  check (status in ('reserved','dispensed','cancelled','failed'));
+
+-- A prescription can only have one active dispensing record (makes retries safe).
+create unique index if not exists uq_active_prescription
+  on pharmacy.dispensing_records (prescription_id)
+  where status <> 'cancelled';
+
+-- Sample catalog so you can test right away.
+insert into pharmacy.medicines (name, unit, stock, reorder_level, expiry_date) values
+  ('Paracetamol 500 mg', 'tablet', 200, 50, '2027-12-31'),
+  ('Ibuprofen 200 mg', 'tablet', 100, 30, '2027-10-31'),
+  ('Cetirizine 10 mg', 'tablet', 80, 20, '2027-08-31'),
+  ('Oral Rehydration Salts', 'sachet', 60, 20, '2028-01-31')
+on conflict (name) do nothing;
+alter table excuse.excuse_slips add column if not exists student_notified boolean not null default false;
+
+create schema if not exists accounts;
+create table if not exists accounts.users (
+  id uuid primary key default gen_random_uuid(),
+  email text not null unique,
+  password_hash text not null,
+  full_name text not null,
+  role text not null check (role in ('admin','doctor','nurse','student')),
+  student_id uuid,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now()
+);

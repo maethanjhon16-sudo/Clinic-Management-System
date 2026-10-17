@@ -5,7 +5,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from zoneinfo import ZoneInfo
+
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
@@ -21,6 +23,8 @@ log = logging.getLogger("appointments")
 
 STUDENT_SERVICE_URL = os.environ.get("STUDENT_SERVICE_URL", "").rstrip("/")
 SLOT_MINUTES = int(os.environ.get("SLOT_MINUTES", "30"))
+NOTIFICATION_SERVICE_URL = os.environ.get("NOTIFICATION_SERVICE_URL", "").rstrip("/")  # optional
+CLINIC_TZ = os.environ.get("CLINIC_TIMEZONE", "Asia/Manila")
 # Free hosts sleep idle services (about 1 minute to wake), so allow long waits and retry.
 http = httpx.Client(timeout=httpx.Timeout(90.0, connect=90.0))
 MAX_ATTEMPTS = 4
@@ -139,7 +143,7 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def check_student(student_id: uuid.UUID, request_id: str) -> None:
+def check_student(student_id: uuid.UUID, request_id: str) -> dict:
     """Integration point: ask the Student service whether this student exists and is active."""
     if not STUDENT_SERVICE_URL:
         raise ApiError(503, "SERVICE_NOT_CONFIGURED", "STUDENT_SERVICE_URL is not configured")
@@ -164,8 +168,56 @@ def check_student(student_id: uuid.UUID, request_id: str) -> None:
         raise ApiError(422, "INVALID_STUDENT", "The student does not exist")
     if response.status_code != 200:
         raise ApiError(502, "STUDENT_SERVICE_ERROR", f"The student service returned status {response.status_code}")
-    if not response.json().get("is_active", False):
+    student = response.json()
+    if not student.get("is_active", False):
         raise ApiError(422, "STUDENT_INACTIVE", "The student record is inactive")
+    return student
+
+
+def call(method: str, url: str, request_id: str, json=None) -> httpx.Response:
+    """HTTP call with retries while a sleeping service wakes up (POST only when surely not processed)."""
+    is_get = method == "GET"
+    retry_statuses = {502, 503, 504} if is_get else {502, 503}
+    retry_exceptions = (httpx.ConnectError, httpx.ConnectTimeout) + ((httpx.ReadTimeout,) if is_get else ())
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = http.request(method, url, json=json,
+                                    headers={"x-request-id": request_id, "accept-encoding": "identity"})
+        except retry_exceptions as exc:
+            if attempt == MAX_ATTEMPTS:
+                raise
+            log.warning("%s %s failed (%s), attempt %d/%d", request_id, url, type(exc).__name__, attempt, MAX_ATTEMPTS)
+            time.sleep(2 ** attempt)
+            continue
+        if response.status_code in retry_statuses and attempt < MAX_ATTEMPTS:
+            time.sleep(6 * attempt)
+            continue
+        return response
+
+
+def notify_student(student_id: uuid.UUID, kind: str, appointment_id: uuid.UUID, when: datetime,
+                   doctor_name: str | None, request_id: str) -> None:
+    """Background task: tell the student about a booking change. Failures never affect the booking."""
+    if not (NOTIFICATION_SERVICE_URL and STUDENT_SERVICE_URL):
+        return
+    try:
+        found = call("GET", f"{STUDENT_SERVICE_URL}/students/{student_id}", request_id)
+        if found.status_code != 200:
+            return
+        student = found.json()
+        local = when.astimezone(ZoneInfo(CLINIC_TZ)).strftime("%B %d, %Y at %I:%M %p")
+        with_doctor = f" with {doctor_name}" if doctor_name else ""
+        subject, text = {
+            "appointment_confirmed": ("Appointment confirmed", f"Your clinic appointment{with_doctor} is confirmed for {local}."),
+            "appointment_rescheduled": ("Appointment rescheduled", f"Your clinic appointment{with_doctor} was moved to {local}."),
+            "appointment_cancelled": ("Appointment cancelled", f"Your clinic appointment{with_doctor} on {local} was cancelled."),
+        }[kind]
+        call("POST", f"{NOTIFICATION_SERVICE_URL}/notifications", request_id,
+             json={"recipient_email": student["email"], "type": kind, "subject": subject,
+                   "body": f"Hello {student['full_name']},\n\n{text}\n\nSchool Clinic",
+                   "related_id": str(appointment_id)})
+    except Exception as exc:
+        log.warning("%s could not send %s notification: %s", request_id, kind, exc)
 
 
 def check_doctor(db: Session, doctor_id: uuid.UUID) -> Doctor:
@@ -268,10 +320,11 @@ def update_doctor(doctor_id: uuid.UUID, payload: DoctorUpdate, db: Session = Dep
 
 # ---------- appointments ----------
 @app.post("/appointments", response_model=AppointmentOut, status_code=201)
-def create_appointment(payload: AppointmentCreate, request: Request, db: Session = Depends(get_db)):
+def create_appointment(payload: AppointmentCreate, request: Request, background_tasks: BackgroundTasks,
+                       db: Session = Depends(get_db)):
     request_id = request_id_of(request)
     when = aware(payload.scheduled_at)
-    check_doctor(db, payload.doctor_id)
+    doctor = check_doctor(db, payload.doctor_id)
     check_student(payload.student_id, request_id)
     check_slot(db, payload.doctor_id, when)
     appointment = Appointment(student_id=payload.student_id, doctor_id=payload.doctor_id,
@@ -279,6 +332,8 @@ def create_appointment(payload: AppointmentCreate, request: Request, db: Session
     db.add(appointment)
     commit_or_conflict(db)
     db.refresh(appointment)
+    background_tasks.add_task(notify_student, appointment.student_id, "appointment_confirmed", appointment.id,
+                              appointment.scheduled_at, doctor.full_name, request_id)
     return appointment
 
 
@@ -307,7 +362,8 @@ def read_appointment(appointment_id: uuid.UUID, db: Session = Depends(get_db)):
 
 
 @app.put("/appointments/{appointment_id}", response_model=AppointmentOut)
-def reschedule_appointment(appointment_id: uuid.UUID, payload: AppointmentUpdate, db: Session = Depends(get_db)):
+def reschedule_appointment(appointment_id: uuid.UUID, payload: AppointmentUpdate, request: Request,
+                           background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     appointment = get_appointment(db, appointment_id)
     if appointment.status != "scheduled":
         raise ApiError(409, "INVALID_STATE", f"A {appointment.status} appointment cannot be changed")
@@ -322,6 +378,10 @@ def reschedule_appointment(appointment_id: uuid.UUID, payload: AppointmentUpdate
     appointment.updated_at = now()
     commit_or_conflict(db)
     db.refresh(appointment)
+    if data.get("scheduled_at"):
+        doctor = db.get(Doctor, appointment.doctor_id)
+        background_tasks.add_task(notify_student, appointment.student_id, "appointment_rescheduled", appointment.id,
+                                  appointment.scheduled_at, doctor.full_name if doctor else None, request_id_of(request))
     return appointment
 
 
@@ -337,8 +397,13 @@ def change_status(db: Session, appointment_id: uuid.UUID, new_status: str) -> Ap
 
 
 @app.patch("/appointments/{appointment_id}/cancel", response_model=AppointmentOut)
-def cancel_appointment(appointment_id: uuid.UUID, db: Session = Depends(get_db)):
-    return change_status(db, appointment_id, "cancelled")
+def cancel_appointment(appointment_id: uuid.UUID, request: Request, background_tasks: BackgroundTasks,
+                       db: Session = Depends(get_db)):
+    appointment = change_status(db, appointment_id, "cancelled")
+    doctor = db.get(Doctor, appointment.doctor_id)
+    background_tasks.add_task(notify_student, appointment.student_id, "appointment_cancelled", appointment.id,
+                              appointment.scheduled_at, doctor.full_name if doctor else None, request_id_of(request))
+    return appointment
 
 
 @app.patch("/appointments/{appointment_id}/complete", response_model=AppointmentOut)
