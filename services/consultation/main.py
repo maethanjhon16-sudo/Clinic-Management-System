@@ -3,6 +3,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import unquote
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -66,7 +67,8 @@ class Consultation(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     appointment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), unique=True)
     student_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
-    doctor_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    attended_by_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    attended_by_name: Mapped[str | None] = mapped_column(String, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     needs_excuse: Mapped[bool] = mapped_column(Boolean, default=False)
     rest_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -144,7 +146,7 @@ class ConsultationOut(BaseModel):
     id: uuid.UUID
     appointment_id: uuid.UUID
     student_id: uuid.UUID
-    doctor_id: uuid.UUID
+    attended_by_name: str | None
     notes: str | None
     needs_excuse: bool
     rest_days: int | None
@@ -294,11 +296,17 @@ def create_consultation(payload: ConsultationCreate, request: Request, db: Sessi
         raise ApiError(409, "ALREADY_CONSULTED", "A consultation already exists for this appointment")
 
     appointment = fetch_appointment(payload.appointment_id, request_id)
+    try:
+        attended_by_id = uuid.UUID(request.headers["x-user-id"]) if request.headers.get("x-user-id") else None
+    except ValueError:
+        attended_by_id = None
+    attended_by_name = unquote(request.headers["x-user-name"]) if request.headers.get("x-user-name") else None
 
     consultation = Consultation(
         appointment_id=payload.appointment_id,
         student_id=uuid.UUID(appointment["student_id"]),   # taken from the appointment, not from the client
-        doctor_id=uuid.UUID(appointment["doctor_id"]),
+        attended_by_id=attended_by_id,
+        attended_by_name=attended_by_name,
         notes=payload.notes,
         needs_excuse=payload.needs_excuse,
         rest_days=payload.rest_days if payload.needs_excuse else None,
@@ -326,7 +334,6 @@ def create_consultation(payload: ConsultationCreate, request: Request, db: Sessi
 @app.get("/consultations", response_model=list[ConsultationOut])
 def list_consultations(
     student_id: uuid.UUID | None = None,
-    doctor_id: uuid.UUID | None = None,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
@@ -334,8 +341,6 @@ def list_consultations(
     stmt = select(Consultation)
     if student_id:
         stmt = stmt.where(Consultation.student_id == student_id)
-    if doctor_id:
-        stmt = stmt.where(Consultation.doctor_id == doctor_id)
     rows = db.scalars(stmt.order_by(Consultation.completed_at.desc()).limit(limit).offset(offset)).all()
     return [to_out(c) for c in rows]
 

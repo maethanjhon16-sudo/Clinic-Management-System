@@ -4,9 +4,9 @@ REST API-based system integration project (SIA final project).
 
 - `db/schema.sql` : Postgres schemas, one per service (run in Supabase SQL Editor)
 - `services/student` : Student service (FastAPI)
-- `services/appointments` : Appointments + doctors service (validates students via the Student service)
+- `services/appointments` : Appointments service (clinic time slots, student self-booking, validates students via the Student service)
 - `services/consultation` : Consultation service (completes appointments, triggers pharmacy and excuse follow-ups)
-- `services/pharmacy` : Pharmacy service (medicine catalog, stock, /dispense)
+- `services/pharmacy` : Pharmacy service (medicine catalog, stock, /dispense, student medicine inquiries)
 - `services/excuse` : Excuse & Clearance service (signed tokens, QR codes, public verification)
 - `services/notification` : Notification service (stores, sends and retries messages)
 - `frontend` : React + TypeScript web app
@@ -40,8 +40,9 @@ export STUDENT_SERVICE_URL="http://localhost:8001"
 uvicorn main:app --reload --port 8002
 ```
 Then in the gateway terminal also set `APPOINTMENT_SERVICE_URL="http://localhost:8002"`.
-Business rules: student must exist and be active, doctor must exist and be active, time must be in the future,
-no overlap within SLOT_MINUTES (default 30) for the same doctor, plus a database unique index as a safety net.
+Business rules: the student must exist and be active, the time must be in the future, inside clinic hours and on a
+30-minute slot, with room left in that slot (SLOT_CAPACITY). Bookings for the same time wait for each other
+(a database advisory lock), so a slot can never be oversold. A student can have at most 3 upcoming appointments.
 
 ## Consultation service
 Env: DATABASE_URL, APPOINTMENT_SERVICE_URL (required); PHARMACY_SERVICE_URL, EXCUSE_SERVICE_URL (optional until built).
@@ -58,6 +59,6 @@ Reservations become `dispensed` with `PATCH /dispensing/{id}/confirm`, or are re
 
 ## Security model (gateway)
 Staff and students sign in at `POST /auth/login` and receive a JWT. The gateway checks the token and the role
-(admin, doctor, nurse, student) before forwarding any request. `POST /api/excuses` and `POST /api/notifications`
+(admin, nurse, student) before forwarding any request. `POST /api/excuses` and `POST /api/notifications`
 are internal only. Students can only list their own appointments and excuse slips. The QR verification endpoint
 `GET /api/excuses/verify/{token}` is public and shows validity only, never medical details.

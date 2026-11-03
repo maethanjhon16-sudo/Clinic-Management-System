@@ -13,7 +13,7 @@ import segno
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 from sqlalchemy import Boolean, Date, DateTime, ForeignKey, String, Text, func, select
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.exc import IntegrityError
@@ -31,6 +31,7 @@ STUDENT_SERVICE_URL = os.environ.get("STUDENT_SERVICE_URL", "").rstrip("/")
 NOTIFICATION_SERVICE_URL = os.environ.get("NOTIFICATION_SERVICE_URL", "").rstrip("/")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "").rstrip("/")     # where the QR code should point (optional)
 PUBLIC_API_URL = os.environ.get("PUBLIC_API_URL", "").rstrip("/")  # fallback QR target (optional)
+INSTRUCTOR_EMAIL_DOMAIN = os.environ.get("INSTRUCTOR_EMAIL_DOMAIN", "").lower().lstrip("@")  # optional, e.g. school.edu.ph
 
 http = httpx.Client(timeout=httpx.Timeout(90.0, connect=30.0))
 MAX_ATTEMPTS = 4
@@ -71,7 +72,8 @@ class ExcuseSlip(Base):
     __table_args__ = {"schema": "excuse"}
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    consultation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), unique=True)
+    consultation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), unique=True, nullable=True)
+    inquiry_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), unique=True, nullable=True)
     student_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
     token: Mapped[str] = mapped_column(String, unique=True)
     valid_from: Mapped[date] = mapped_column(Date)
@@ -83,6 +85,18 @@ class ExcuseSlip(Base):
     student_notified: Mapped[bool] = mapped_column(Boolean, default=False)
 
     recipients: Mapped[list["SlipRecipient"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+
+
+class Instructor(Base):
+    __tablename__ = "instructors"
+    __table_args__ = {"schema": "excuse"}
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    full_name: Mapped[str] = mapped_column(String)
+    email: Mapped[str] = mapped_column(String, unique=True)
+    department: Mapped[str | None] = mapped_column(String, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class SlipRecipient(Base):
@@ -97,10 +111,47 @@ class SlipRecipient(Base):
 
 # ---------- schemas ----------
 class ExcuseCreate(BaseModel):
-    consultation_id: uuid.UUID
+    consultation_id: uuid.UUID | None = None   # the slip comes from a consultation...
+    inquiry_id: uuid.UUID | None = None        # ...or from a medicine inquiry (issued at pick-up)
     student_id: uuid.UUID
     rest_days: int = Field(ge=1, le=30)
     issued_on: date | None = None
+
+    @model_validator(mode="after")
+    def exactly_one_source(self):
+        if (self.consultation_id is None) == (self.inquiry_id is None):
+            raise ValueError("provide either consultation_id or inquiry_id")
+        return self
+
+
+class InstructorIn(BaseModel):
+    full_name: str = Field(min_length=1, max_length=150)
+    email: EmailStr
+    department: str | None = Field(default=None, max_length=100)
+
+
+class InstructorBulkIn(BaseModel):
+    items: list[InstructorIn] = Field(min_length=1, max_length=200)
+
+
+class InstructorUpdate(BaseModel):
+    full_name: str | None = Field(default=None, min_length=1, max_length=150)
+    email: EmailStr | None = None
+    department: str | None = Field(default=None, max_length=100)
+    is_active: bool | None = None
+
+
+class InstructorOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    full_name: str
+    email: str
+    department: str | None
+    is_active: bool
+
+
+class NotifyInstructorsIn(BaseModel):
+    instructor_ids: list[uuid.UUID] = Field(min_length=1, max_length=50)
 
 
 class RecipientIn(BaseModel):
@@ -122,7 +173,8 @@ class RecipientOut(BaseModel):
 class SlipOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
-    consultation_id: uuid.UUID
+    consultation_id: uuid.UUID | None
+    inquiry_id: uuid.UUID | None
     student_id: uuid.UUID
     token: str
     valid_from: date
@@ -267,6 +319,17 @@ def notify_instructor_task(slip_id: uuid.UUID, recipient_id: uuid.UUID, link: st
         send_notification(recipient.instructor_email, "excuse_instructor", "Medical excuse notice", text, slip.id, request_id)
 
 
+def find_existing(db: Session, payload: "ExcuseCreate") -> ExcuseSlip | None:
+    if payload.consultation_id:
+        return db.scalar(select(ExcuseSlip).where(ExcuseSlip.consultation_id == payload.consultation_id))
+    return db.scalar(select(ExcuseSlip).where(ExcuseSlip.inquiry_id == payload.inquiry_id))
+
+
+def check_domain(email: str) -> None:
+    if INSTRUCTOR_EMAIL_DOMAIN and not email.lower().endswith("@" + INSTRUCTOR_EMAIL_DOMAIN):
+        raise ApiError(422, "INVALID_EMAIL_DOMAIN", f"Instructor emails must end with @{INSTRUCTOR_EMAIL_DOMAIN}")
+
+
 def get_slip(db: Session, slip_id: uuid.UUID) -> ExcuseSlip:
     slip = db.get(ExcuseSlip, slip_id)
     if not slip:
@@ -284,19 +347,20 @@ def health():
 def create_excuse(payload: ExcuseCreate, request: Request, response: Response,
                   background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """Internal: called by the Consultation service. Repeating the call returns the same slip."""
-    existing = db.scalar(select(ExcuseSlip).where(ExcuseSlip.consultation_id == payload.consultation_id))
+    existing = find_existing(db, payload)
     if existing:
         response.status_code = 200
         return slip_out(existing)
     issued_on = payload.issued_on or today()
-    slip = ExcuseSlip(consultation_id=payload.consultation_id, student_id=payload.student_id, token=make_token(),
+    slip = ExcuseSlip(consultation_id=payload.consultation_id, inquiry_id=payload.inquiry_id,
+                      student_id=payload.student_id, token=make_token(),
                       valid_from=issued_on, valid_until=issued_on + timedelta(days=payload.rest_days - 1))
     db.add(slip)
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
-        existing = db.scalar(select(ExcuseSlip).where(ExcuseSlip.consultation_id == payload.consultation_id))
+        existing = find_existing(db, payload)
         if existing:
             response.status_code = 200
             return slip_out(existing)
@@ -391,4 +455,96 @@ def notify_student_again(slip_id: uuid.UUID, request: Request, background_tasks:
                          db: Session = Depends(get_db)):
     slip = get_slip(db, slip_id)
     background_tasks.add_task(notify_student_task, slip.id, verification_link(request, slip.token), request_id_of(request))
+    return slip_out(slip)
+
+
+# ---------- instructors (filled in once, then picked from a list) ----------
+@app.get("/instructors", response_model=list[InstructorOut])
+def list_instructors(q: str | None = None, active_only: bool = True,
+                     limit: int = Query(default=200, ge=1, le=500), db: Session = Depends(get_db)):
+    stmt = select(Instructor)
+    if active_only:
+        stmt = stmt.where(Instructor.is_active.is_(True))
+    if q:
+        like = f"%{q}%"
+        stmt = stmt.where(Instructor.full_name.ilike(like) | Instructor.email.ilike(like) | Instructor.department.ilike(like))
+    return db.scalars(stmt.order_by(Instructor.full_name).limit(limit)).all()
+
+
+@app.post("/instructors", response_model=InstructorOut, status_code=201)
+def create_instructor(payload: InstructorIn, db: Session = Depends(get_db)):
+    check_domain(payload.email)
+    instructor = Instructor(full_name=payload.full_name.strip(), email=payload.email.lower(),
+                            department=(payload.department or None))
+    db.add(instructor)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise ApiError(409, "CONFLICT", "An instructor with this email already exists")
+    db.refresh(instructor)
+    return instructor
+
+
+@app.post("/instructors/bulk")
+def create_instructors_bulk(payload: InstructorBulkIn, db: Session = Depends(get_db)):
+    """Add many instructors at once. Emails that already exist, or do not match the school domain, are skipped."""
+    existing = {e.lower() for e in db.scalars(select(Instructor.email)).all()}
+    created, skipped = 0, []
+    for item in payload.items:
+        email = item.email.lower()
+        if email in existing or (INSTRUCTOR_EMAIL_DOMAIN and not email.endswith("@" + INSTRUCTOR_EMAIL_DOMAIN)):
+            skipped.append(email)
+            continue
+        db.add(Instructor(full_name=item.full_name.strip(), email=email, department=item.department or None))
+        existing.add(email)
+        created += 1
+    db.commit()
+    return {"created": created, "skipped": skipped}
+
+
+@app.put("/instructors/{instructor_id}", response_model=InstructorOut)
+def update_instructor(instructor_id: uuid.UUID, payload: InstructorUpdate, db: Session = Depends(get_db)):
+    instructor = db.get(Instructor, instructor_id)
+    if not instructor:
+        raise HTTPException(status_code=404, detail="Instructor not found")
+    data = payload.model_dump(exclude_unset=True)
+    if data.get("email"):
+        check_domain(data["email"])
+        data["email"] = data["email"].lower()
+    for field, value in data.items():
+        setattr(instructor, field, value)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise ApiError(409, "CONFLICT", "An instructor with this email already exists")
+    db.refresh(instructor)
+    return instructor
+
+
+@app.post("/excuses/{slip_id}/notify-instructors", response_model=SlipOut)
+def notify_instructors(slip_id: uuid.UUID, payload: NotifyInstructorsIn, request: Request,
+                       background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """Send the slip to instructors picked from the list. Instructors who already received it are skipped."""
+    slip = get_slip(db, slip_id)
+    if slip.status == "revoked":
+        raise ApiError(409, "INVALID_STATE", "A revoked slip cannot be sent to instructors")
+    instructors = db.scalars(select(Instructor).where(Instructor.id.in_(payload.instructor_ids),
+                                                      Instructor.is_active.is_(True))).all()
+    if not instructors:
+        raise ApiError(422, "NO_INSTRUCTORS", "None of the selected instructors could be found")
+    already = {r.instructor_email.lower() for r in slip.recipients}
+    added = []
+    for instructor in instructors:
+        if instructor.email.lower() in already:
+            continue
+        recipient = SlipRecipient(slip_id=slip.id, instructor_name=instructor.full_name, instructor_email=instructor.email)
+        db.add(recipient)
+        added.append(recipient)
+    db.commit()
+    db.refresh(slip)
+    link = verification_link(request, slip.token)
+    for recipient in added:
+        background_tasks.add_task(notify_instructor_task, slip.id, recipient.id, link, request_id_of(request))
     return slip_out(slip)

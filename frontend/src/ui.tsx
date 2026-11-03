@@ -56,7 +56,7 @@ export function useAction() {
 }
 
 export function Loading({ show }: { show: boolean }) {
-  return show ? <p className="muted">Loading... the first request can take up to a minute while the servers wake up.</p> : null;
+  return show ? <p className="muted">Loading. The first request can take up to a minute while the system starts.</p> : null;
 }
 export function ErrorBox({ message }: { message: string }) {
   return message ? <div className="alert error">{message}</div> : null;
@@ -77,3 +77,19 @@ export const fmtDate = (iso: string) =>
   new Date(`${iso.slice(0, 10)}T00:00:00`).toLocaleDateString("en-PH", { dateStyle: "medium" });
 // A <input type="datetime-local"> value is read as Philippine time.
 export const toManilaIso = (local: string) => (local.length === 16 ? `${local}:00+08:00` : local);
+
+export function PageHeader({ title, subtitle }: { title: string; subtitle?: string }) {
+  return (
+    <div className="page-head">
+      <h1>{title}</h1>
+      {subtitle && <p>{subtitle}</p>}
+    </div>
+  );
+}
+export function EmptyRow({ show, cols, text }: { show: boolean; cols: number; text: string }) {
+  return show ? <tr><td colSpan={cols} className="empty">{text}</td></tr> : null;
+}
+export const roleLabel = (role: string) => (role === "admin" ? "Administrator" : role === "nurse" ? "Clinic nurse" : "Student");
+export const todayManila = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Manila" });
+export const fmtTime = (iso: string) =>
+  new Date(iso).toLocaleTimeString("en-PH", { timeZone: "Asia/Manila", hour: "numeric", minute: "2-digit" });

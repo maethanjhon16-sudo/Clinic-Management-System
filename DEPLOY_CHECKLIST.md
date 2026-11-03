@@ -40,4 +40,4 @@ Then: gateway ALLOWED_ORIGINS=<static site address>,http://localhost:5173  (no s
 Local test first: copy .env.example to .env, set VITE_API_URL, run npm install then npm run dev.
 
 ## 6. First login
-Open the site, sign in with ADMIN_EMAIL / ADMIN_PASSWORD, then create doctor, nurse and student users on the Users page.
+Open the site, sign in with ADMIN_EMAIL / ADMIN_PASSWORD, then create nurse and student users on the Users page.

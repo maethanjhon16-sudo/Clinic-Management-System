@@ -1,27 +1,45 @@
-import { api, Appointment, Medicine, Student } from "../api";
-import { ErrorBox, Loading, useLoad } from "../ui";
+import { Link } from "react-router-dom";
+import { api, Inquiry, Medicine, Student } from "../api";
+import { EmptyRow, ErrorBox, fmtDateTime, Loading, PageHeader, useLoad } from "../ui";
 
 interface Summary { sent: number; failed: number; pending: number }
 
 export default function Dashboard() {
+  const waiting = useLoad(() => api<Inquiry[]>("/api/inquiries?status=pending&limit=200"), []);
+  const ready = useLoad(() => api<Inquiry[]>("/api/inquiries?status=ready&limit=200"), []);
   const students = useLoad(() => api<Student[]>("/api/students?limit=200"), []);
-  const scheduled = useLoad(() => api<Appointment[]>("/api/appointments?status=scheduled&limit=200"), []);
   const medicines = useLoad(() => api<Medicine[]>("/api/medicines?limit=500"), []);
   const notices = useLoad(() => api<Summary>("/api/notifications/summary"), []);
-  const error = students.error || scheduled.error || medicines.error || notices.error;
-  const loading = students.loading || scheduled.loading || medicines.loading || notices.loading;
-  const lowStock = (medicines.data ?? []).filter((m) => m.low_stock || m.expired).length;
+  const error = waiting.error || ready.error || students.error || medicines.error || notices.error;
+  const loading = waiting.loading || ready.loading || students.loading || medicines.loading || notices.loading;
+  const attention = (medicines.data ?? []).filter((m) => m.low_stock || m.expired).length;
+  const studentName = (id: string) => students.data?.find((s) => s.id === id)?.full_name ?? "Unknown student";
 
   return (
     <>
-      <h2>Dashboard</h2>
+      <PageHeader title="Dashboard" subtitle="What needs attention in the clinic today." />
       <Loading show={loading} />
       <ErrorBox message={error} />
-      <div className="grid">
-        <div className="stat"><b>{students.data?.length ?? "-"}</b><span>Active students</span></div>
-        <div className="stat"><b>{scheduled.data?.length ?? "-"}</b><span>Upcoming appointments</span></div>
-        <div className="stat"><b>{medicines.data ? lowStock : "-"}</b><span>Medicines low or expired</span></div>
+      <div className="stats">
+        <div className="stat"><b>{waiting.data?.length ?? "-"}</b><span>Inquiries waiting for a reply</span></div>
+        <div className="stat"><b>{ready.data?.length ?? "-"}</b><span>Medicine ready for pick-up</span></div>
+        <div className="stat"><b>{medicines.data ? attention : "-"}</b><span>Medicines low or expired</span></div>
         <div className="stat"><b>{notices.data?.failed ?? "-"}</b><span>Failed notifications</span></div>
+      </div>
+      <div className="card">
+        <h2>Inquiries waiting for a reply</h2>
+        <p className="sub">Check the stock and reply with a pick-up date. <Link to="/inquiries">Go to medicine inquiries</Link></p>
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Received</th><th>Student</th><th>Symptoms</th></tr></thead>
+            <tbody>
+              {(waiting.data ?? []).slice(0, 8).map((i) => (
+                <tr key={i.id}><td>{fmtDateTime(i.created_at)}</td><td>{studentName(i.student_id)}</td><td>{i.symptoms.join(", ")}</td></tr>
+              ))}
+              <EmptyRow show={!loading && (waiting.data ?? []).length === 0} cols={3} text="No inquiries are waiting." />
+            </tbody>
+          </table>
+        </div>
       </div>
     </>
   );

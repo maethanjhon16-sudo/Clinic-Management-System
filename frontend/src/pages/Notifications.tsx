@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api, Notice, post } from "../api";
 import { useAuth } from "../auth";
-import { Badge, ErrorBox, Field, fmtDateTime, Loading, OkBox, useAction, useLoad } from "../ui";
+import { Badge, EmptyRow, ErrorBox, fmtDateTime, Loading, OkBox, PageHeader, useAction, useLoad } from "../ui";
 
 interface Summary { sent: number; failed: number; pending: number }
 
@@ -16,45 +16,47 @@ export default function Notifications() {
   function refresh() { list.reload(); summary.reload(); }
 
   async function retryOne(n: Notice) {
-    if (await act.run(() => post(`/api/notifications/${n.id}/retry`), "Retried.")) refresh();
+    if (await act.run(() => post(`/api/notifications/${n.id}/retry`), "The message was sent again.")) refresh();
   }
   async function retryAll() {
-    if (await act.run(() => post(`/api/notifications/retry-failed`), "Retried all failed notifications.")) refresh();
+    if (await act.run(() => post(`/api/notifications/retry-failed`), "All failed messages were sent again.")) refresh();
   }
 
   return (
     <>
-      <h2>Notifications</h2>
-      <div className="grid" style={{ marginBottom: 16 }}>
+      <PageHeader title="Notifications" subtitle="Messages sent to students and instructors, and their delivery status." />
+      <div className="stats">
         <div className="stat"><b>{summary.data?.sent ?? "-"}</b><span>Sent</span></div>
         <div className="stat"><b>{summary.data?.failed ?? "-"}</b><span>Failed</span></div>
         <div className="stat"><b>{summary.data?.pending ?? "-"}</b><span>Pending</span></div>
       </div>
-      <ErrorBox message={act.error} />
-      <OkBox message={act.notice} />
       <div className="card">
-        <div className="row" style={{ marginBottom: 10 }}>
-          <Field label="Status">
+        <div className="inline" style={{ marginBottom: 16 }}>
+          <div className="field" style={{ minWidth: 200 }}>
+            <label>Status</label>
             <select value={status} onChange={(e) => setStatus(e.target.value)}>
-              <option value="">All</option><option value="sent">Sent</option><option value="failed">Failed</option><option value="pending">Pending</option>
+              <option value="">All messages</option><option value="sent">Sent</option><option value="failed">Failed</option><option value="pending">Pending</option>
             </select>
-          </Field>
+          </div>
           {isAdmin && <button onClick={retryAll} disabled={act.busy}>Retry all failed</button>}
         </div>
+        <ErrorBox message={act.error} />
+        <OkBox message={act.notice} />
         <Loading show={list.loading} />
         <ErrorBox message={list.error} />
-        <div className="scroll">
+        <div className="table-wrap">
           <table>
-            <thead><tr><th>Created</th><th>To</th><th>Type</th><th>Subject</th><th>Status</th><th>Tries</th>{isAdmin && <th></th>}</tr></thead>
+            <thead><tr><th>Created</th><th>Recipient</th><th>Subject</th><th>Status</th><th>Attempts</th><th></th></tr></thead>
             <tbody>
               {(list.data ?? []).map((n) => (
                 <tr key={n.id}>
-                  <td>{fmtDateTime(n.created_at)}</td><td>{n.recipient_email}</td><td>{n.type}</td><td>{n.subject}</td>
+                  <td>{fmtDateTime(n.created_at)}</td><td>{n.recipient_email}</td><td>{n.subject}</td>
                   <td><Badge value={n.status} />{n.last_error && <div className="muted">{n.last_error}</div>}</td>
                   <td>{n.attempts}</td>
-                  {isAdmin && <td>{n.status !== "sent" && <button className="small" onClick={() => retryOne(n)} disabled={act.busy}>Retry</button>}</td>}
+                  <td>{isAdmin && n.status !== "sent" && <button className="small" onClick={() => retryOne(n)} disabled={act.busy}>Retry</button>}</td>
                 </tr>
               ))}
+              <EmptyRow show={!list.loading && (list.data ?? []).length === 0} cols={6} text="No messages to show." />
             </tbody>
           </table>
         </div>

@@ -1,116 +1,83 @@
 import { FormEvent, useState } from "react";
-import { api, Appointment, Doctor, patch, post, Student } from "../api";
-import { useAuth } from "../auth";
-import { Badge, ErrorBox, Field, fmtDateTime, Loading, OkBox, toManilaIso, useAction, useLoad } from "../ui";
+import { api, Appointment, patch, post, Student } from "../api";
+import SlotPicker from "../SlotPicker";
+import { Badge, EmptyRow, ErrorBox, fmtDateTime, Loading, OkBox, PageHeader, useAction, useLoad } from "../ui";
 
 export default function Appointments() {
-  const { user } = useAuth();
-  const canWrite = user?.role !== undefined && user.role !== "student";
-  const isAdmin = user?.role === "admin";
   const [status, setStatus] = useState("");
-  const [form, setForm] = useState({ student_id: "", doctor_id: "", when: "", reason: "" });
-  const [doc, setDoc] = useState({ full_name: "", specialization: "", email: "" });
+  const [studentId, setStudentId] = useState("");
+  const [when, setWhen] = useState("");
+  const [reason, setReason] = useState("");
+  const [pickerKey, setPickerKey] = useState(0);
   const students = useLoad(() => api<Student[]>("/api/students?limit=200"), []);
-  const doctors = useLoad(() => api<Doctor[]>("/api/doctors"), []);
   const list = useLoad(() => api<Appointment[]>(`/api/appointments?limit=200${status ? `&status=${status}` : ""}`), [status]);
   const book = useAction();
   const other = useAction();
 
-  const studentName = (id: string) => students.data?.find((s) => s.id === id)?.full_name ?? id.slice(0, 8);
-  const doctorName = (id: string) => doctors.data?.find((d) => d.id === id)?.full_name ?? id.slice(0, 8);
+  const studentName = (id: string) => students.data?.find((s) => s.id === id)?.full_name ?? "Unknown student";
 
   async function submit(e: FormEvent) {
     e.preventDefault();
-    const ok = await book.run(
-      () => post<Appointment>("/api/appointments", {
-        student_id: form.student_id, doctor_id: form.doctor_id,
-        scheduled_at: toManilaIso(form.when), reason: form.reason || null,
-      }),
-      "Appointment booked. The student will be notified."
-    );
-    if (ok) { setForm({ ...form, when: "", reason: "" }); list.reload(); }
+    const ok = await book.run(async () => {
+      if (!studentId) throw new Error("Please select a student.");
+      if (!when) throw new Error("Please choose a date and an available time.");
+      await post<Appointment>("/api/appointments", { student_id: studentId, scheduled_at: when, reason: reason || null });
+    }, "The appointment was booked and the student will be notified.");
+    if (ok) { setWhen(""); setReason(""); setPickerKey(pickerKey + 1); list.reload(); }
   }
 
   async function cancel(a: Appointment) {
-    if (!window.confirm("Cancel this appointment?")) return;
-    if (await other.run(() => patch(`/api/appointments/${a.id}/cancel`), "Appointment cancelled.")) list.reload();
-  }
-
-  async function addDoctor(e: FormEvent) {
-    e.preventDefault();
-    const ok = await other.run(
-      () => post<Doctor>("/api/doctors", {
-        full_name: doc.full_name, specialization: doc.specialization || null, email: doc.email || null,
-      }),
-      "Doctor added."
-    );
-    if (ok) { setDoc({ full_name: "", specialization: "", email: "" }); doctors.reload(); }
+    if (!window.confirm("Cancel this appointment? The student will be notified.")) return;
+    if (await other.run(() => patch(`/api/appointments/${a.id}/cancel`), "The appointment was cancelled.")) list.reload();
   }
 
   return (
     <>
-      <h2>Appointments</h2>
-      {canWrite && (
-        <form className="card" onSubmit={submit}>
-          <h3>Book an appointment</h3>
-          <div className="row">
-            <Field label="Student">
-              <select value={form.student_id} onChange={(e) => setForm({ ...form, student_id: e.target.value })} required>
-                <option value="">Select...</option>
-                {(students.data ?? []).map((s) => <option key={s.id} value={s.id}>{s.full_name} ({s.student_number})</option>)}
-              </select>
-            </Field>
-            <Field label="Doctor">
-              <select value={form.doctor_id} onChange={(e) => setForm({ ...form, doctor_id: e.target.value })} required>
-                <option value="">Select...</option>
-                {(doctors.data ?? []).map((d) => <option key={d.id} value={d.id}>{d.full_name}</option>)}
-              </select>
-            </Field>
-            <Field label="Date and time (Philippine time)">
-              <input type="datetime-local" value={form.when} onChange={(e) => setForm({ ...form, when: e.target.value })} required />
-            </Field>
-            <Field label="Reason"><input value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} /></Field>
-            <button type="submit" disabled={book.busy}>{book.busy ? "Booking..." : "Book"}</button>
+      <PageHeader title="Appointments" subtitle="Schedule visits for students and manage the clinic calendar." />
+      <form className="card" onSubmit={submit}>
+        <h2>Schedule an appointment</h2>
+        <p className="sub">Choose the student, then a date and an available time.</p>
+        <div className="form-grid" style={{ marginBottom: 18 }}>
+          <div className="field">
+            <label>Student</label>
+            <select value={studentId} onChange={(e) => setStudentId(e.target.value)}>
+              <option value="">Select a student</option>
+              {(students.data ?? []).map((s) => <option key={s.id} value={s.id}>{s.full_name} ({s.student_number})</option>)}
+            </select>
           </div>
-          <ErrorBox message={book.error} />
-          <OkBox message={book.notice} />
-        </form>
-      )}
-      {isAdmin && (
-        <form className="card" onSubmit={addDoctor}>
-          <h3>Add a doctor</h3>
-          <div className="row">
-            <Field label="Full name"><input value={doc.full_name} onChange={(e) => setDoc({ ...doc, full_name: e.target.value })} required /></Field>
-            <Field label="Specialization"><input value={doc.specialization} onChange={(e) => setDoc({ ...doc, specialization: e.target.value })} /></Field>
-            <Field label="Email"><input type="email" value={doc.email} onChange={(e) => setDoc({ ...doc, email: e.target.value })} /></Field>
-            <button type="submit" disabled={other.busy}>Add doctor</button>
-          </div>
-        </form>
-      )}
-      <ErrorBox message={other.error} />
-      <OkBox message={other.notice} />
+          <div className="field"><label>Reason for visit</label><input value={reason} onChange={(e) => setReason(e.target.value)} /></div>
+        </div>
+        <SlotPicker key={pickerKey} value={when} onChange={setWhen} />
+        <div className="actions"><button type="submit" disabled={book.busy}>{book.busy ? "Booking..." : "Book appointment"}</button></div>
+        <ErrorBox message={book.error} />
+        <OkBox message={book.notice} />
+      </form>
       <div className="card">
-        <div className="row" style={{ marginBottom: 10 }}>
-          <Field label="Status">
+        <div className="inline" style={{ marginBottom: 16 }}>
+          <div className="field" style={{ minWidth: 200 }}>
+            <label>Status</label>
             <select value={status} onChange={(e) => setStatus(e.target.value)}>
-              <option value="">All</option><option value="scheduled">Scheduled</option>
+              <option value="">All appointments</option><option value="scheduled">Scheduled</option>
               <option value="completed">Completed</option><option value="cancelled">Cancelled</option>
             </select>
-          </Field>
+          </div>
         </div>
+        <ErrorBox message={other.error} />
+        <OkBox message={other.notice} />
         <Loading show={list.loading} />
         <ErrorBox message={list.error} />
-        <div className="scroll">
+        <div className="table-wrap">
           <table>
-            <thead><tr><th>When</th><th>Student</th><th>Doctor</th><th>Reason</th><th>Status</th>{canWrite && <th></th>}</tr></thead>
+            <thead><tr><th>Date and time</th><th>Student</th><th>Reason</th><th>Status</th><th></th></tr></thead>
             <tbody>
               {(list.data ?? []).map((a) => (
                 <tr key={a.id}>
-                  <td>{fmtDateTime(a.scheduled_at)}</td><td>{studentName(a.student_id)}</td><td>{doctorName(a.doctor_id)}</td>
+                  <td>{fmtDateTime(a.scheduled_at)}</td><td>{studentName(a.student_id)}</td>
                   <td>{a.reason ?? ""}</td><td><Badge value={a.status} /></td>
-                  {canWrite && <td>{a.status === "scheduled" && <button className="small danger" onClick={() => cancel(a)}>Cancel</button>}</td>}
+                  <td>{a.status === "scheduled" && <button className="small danger" onClick={() => cancel(a)}>Cancel</button>}</td>
                 </tr>
               ))}
+              <EmptyRow show={!list.loading && (list.data ?? []).length === 0} cols={5} text="No appointments found." />
             </tbody>
           </table>
         </div>

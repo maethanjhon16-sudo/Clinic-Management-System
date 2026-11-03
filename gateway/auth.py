@@ -69,7 +69,7 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=72)
     full_name: str = Field(min_length=1, max_length=150)
-    role: Literal["admin", "doctor", "nurse", "student"]
+    role: Literal["admin", "nurse", "student"]
     student_id: uuid.UUID | None = None
 
     @model_validator(mode="after")

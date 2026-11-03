@@ -64,6 +64,12 @@ services:
         value: 3.12.3
       - key: DATABASE_URL
         sync: false
+      - key: STUDENT_SERVICE_URL
+        sync: false
+      - key: NOTIFICATION_SERVICE_URL
+        sync: false
+      - key: EXCUSE_SERVICE_URL
+        sync: false
 
   - type: web
     name: clinic-excuse-service

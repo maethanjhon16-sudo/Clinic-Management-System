@@ -2,16 +2,15 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
-
-import httpx
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, and_, func, select
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import DateTime, String, func, select, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, Session, mapped_column
@@ -22,14 +21,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("appointments")
 
 STUDENT_SERVICE_URL = os.environ.get("STUDENT_SERVICE_URL", "").rstrip("/")
-SLOT_MINUTES = int(os.environ.get("SLOT_MINUTES", "30"))
 NOTIFICATION_SERVICE_URL = os.environ.get("NOTIFICATION_SERVICE_URL", "").rstrip("/")  # optional
+
+# Clinic schedule (all adjustable with environment variables)
 CLINIC_TZ = os.environ.get("CLINIC_TIMEZONE", "Asia/Manila")
+TZ = ZoneInfo(CLINIC_TZ)
+SLOT_MINUTES = int(os.environ.get("SLOT_MINUTES", "30"))
+SLOT_CAPACITY = int(os.environ.get("SLOT_CAPACITY", "1"))            # how many students can be seen at the same time
+OPEN_TIME = dtime.fromisoformat(os.environ.get("CLINIC_OPEN", "08:00"))
+CLOSE_TIME = dtime.fromisoformat(os.environ.get("CLINIC_CLOSE", "17:00"))
+CLINIC_DAYS = {int(d) for d in os.environ.get("CLINIC_DAYS", "0,1,2,3,4").split(",") if d.strip()}  # Monday = 0
+MAX_UPCOMING = int(os.environ.get("MAX_UPCOMING_PER_STUDENT", "3"))
+
 # Free hosts sleep idle services (about 1 minute to wake), so allow long waits and retry.
 http = httpx.Client(timeout=httpx.Timeout(90.0, connect=90.0))
 MAX_ATTEMPTS = 4
 
-app = FastAPI(title="Appointments Service", version="1.0.0")
+app = FastAPI(title="Appointments Service", version="2.0.0")
 
 
 # ---------- errors ----------
@@ -59,26 +67,32 @@ async def validation_error(_: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content=body("VALIDATION_ERROR", "Invalid request data", details))
 
 
-# ---------- models ----------
-class Doctor(Base):
-    __tablename__ = "doctors"
-    __table_args__ = {"schema": "appointments"}
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    full_name: Mapped[str] = mapped_column(String)
-    specialization: Mapped[str | None] = mapped_column(String, nullable=True)
-    email: Mapped[str | None] = mapped_column(String, unique=True, nullable=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+# ---------- who is calling (set by the gateway after it checked the login) ----------
+class Actor:
+    def __init__(self, role: str | None, student_id: uuid.UUID | None):
+        self.role, self.student_id = role, student_id
 
 
+def actor_of(request: Request) -> Actor:
+    raw = request.headers.get("x-student-id")
+    try:
+        student_id = uuid.UUID(raw) if raw else None
+    except ValueError:
+        student_id = None
+    return Actor(request.headers.get("x-user-role"), student_id)
+
+
+def request_id_of(request: Request) -> str:
+    return request.headers.get("x-request-id", str(uuid.uuid4()))
+
+
+# ---------- model ----------
 class Appointment(Base):
     __tablename__ = "appointments"
     __table_args__ = {"schema": "appointments"}
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     student_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
-    doctor_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("appointments.doctors.id"))
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     reason: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String, default="scheduled")
@@ -87,32 +101,8 @@ class Appointment(Base):
 
 
 # ---------- schemas ----------
-class DoctorCreate(BaseModel):
-    full_name: str = Field(min_length=1, max_length=150)
-    specialization: str | None = None
-    email: EmailStr | None = None
-
-
-class DoctorUpdate(BaseModel):
-    full_name: str | None = Field(default=None, min_length=1, max_length=150)
-    specialization: str | None = None
-    email: EmailStr | None = None
-    is_active: bool | None = None
-
-
-class DoctorOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-    id: uuid.UUID
-    full_name: str
-    specialization: str | None
-    email: str | None
-    is_active: bool
-    created_at: datetime
-
-
 class AppointmentCreate(BaseModel):
     student_id: uuid.UUID
-    doctor_id: uuid.UUID
     scheduled_at: datetime
     reason: str | None = Field(default=None, max_length=500)
 
@@ -126,12 +116,25 @@ class AppointmentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
     student_id: uuid.UUID
-    doctor_id: uuid.UUID
     scheduled_at: datetime
     reason: str | None
     status: str
     created_at: datetime
     updated_at: datetime
+
+
+class SlotOut(BaseModel):
+    start: datetime
+    label: str
+    available: bool
+    remaining: int
+
+
+class AvailabilityOut(BaseModel):
+    day: date
+    closed: bool
+    message: str | None
+    slots: list[SlotOut]
 
 
 # ---------- helpers ----------
@@ -143,35 +146,46 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def check_student(student_id: uuid.UUID, request_id: str) -> dict:
-    """Integration point: ask the Student service whether this student exists and is active."""
-    if not STUDENT_SERVICE_URL:
-        raise ApiError(503, "SERVICE_NOT_CONFIGURED", "STUDENT_SERVICE_URL is not configured")
-    url = f"{STUDENT_SERVICE_URL}/students/{student_id}"
-    response = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            response = http.get(url, headers={"x-request-id": request_id, "accept-encoding": "identity"})
-        except (httpx.ConnectError, httpx.TimeoutException) as exc:
-            log.warning("%s student service call failed (%s), attempt %d/%d", request_id, type(exc).__name__, attempt, MAX_ATTEMPTS)
-            if attempt == MAX_ATTEMPTS:
-                raise ApiError(503, "STUDENT_SERVICE_UNAVAILABLE", "The student service is not responding",
-                               {"request_id": request_id, "reason": type(exc).__name__})
-            time.sleep(2 ** attempt)
-            continue
-        log.info("%s GET %s -> %s (attempt %d)", request_id, url, response.status_code, attempt)
-        if response.status_code in (502, 503, 504) and attempt < MAX_ATTEMPTS:
-            time.sleep(6 * attempt)  # the student service may still be waking up
-            continue
-        break
-    if response.status_code == 404:
-        raise ApiError(422, "INVALID_STUDENT", "The student does not exist")
-    if response.status_code != 200:
-        raise ApiError(502, "STUDENT_SERVICE_ERROR", f"The student service returned status {response.status_code}")
-    student = response.json()
-    if not student.get("is_active", False):
-        raise ApiError(422, "STUDENT_INACTIVE", "The student record is inactive")
-    return student
+def clock(t: dtime) -> str:
+    return datetime.combine(date.today(), t).strftime("%I:%M %p").lstrip("0")
+
+
+def check_clinic_hours(when: datetime) -> None:
+    local = when.astimezone(TZ)
+    if local.weekday() not in CLINIC_DAYS:
+        raise ApiError(422, "CLINIC_CLOSED", "The clinic is closed on this day")
+    minutes = local.hour * 60 + local.minute
+    open_m, close_m = OPEN_TIME.hour * 60 + OPEN_TIME.minute, CLOSE_TIME.hour * 60 + CLOSE_TIME.minute
+    if minutes < open_m or minutes + SLOT_MINUTES > close_m:
+        raise ApiError(422, "OUTSIDE_HOURS", f"Appointments are available from {clock(OPEN_TIME)} to {clock(CLOSE_TIME)}")
+    if (minutes - open_m) % SLOT_MINUTES != 0 or local.second or local.microsecond:
+        raise ApiError(422, "INVALID_SLOT", f"Appointments start every {SLOT_MINUTES} minutes")
+
+
+def lock_slot(db: Session, when: datetime) -> None:
+    """Make concurrent bookings for the same time wait for each other, so a slot cannot be oversold."""
+    db.execute(text("select pg_advisory_xact_lock(hashtext(:key))"), {"key": when.astimezone(timezone.utc).isoformat()})
+
+
+def check_capacity(db: Session, when: datetime, exclude_id: uuid.UUID | None = None) -> None:
+    stmt = select(func.count()).select_from(Appointment).where(Appointment.scheduled_at == when,
+                                                               Appointment.status != "cancelled")
+    if exclude_id:
+        stmt = stmt.where(Appointment.id != exclude_id)
+    if (db.scalar(stmt) or 0) >= SLOT_CAPACITY:
+        raise ApiError(409, "SLOT_FULL", "This time is no longer available. Please choose another time.")
+
+
+def check_student_limits(db: Session, student_id: uuid.UUID, when: datetime, exclude_id: uuid.UUID | None = None,
+                         limit_upcoming: bool = True) -> None:
+    base = select(func.count()).select_from(Appointment).where(Appointment.student_id == student_id,
+                                                               Appointment.status == "scheduled")
+    if exclude_id:
+        base = base.where(Appointment.id != exclude_id)
+    if (db.scalar(base.where(Appointment.scheduled_at == when)) or 0) > 0:
+        raise ApiError(409, "DUPLICATE_BOOKING", "This student already has an appointment at this time")
+    if limit_upcoming and (db.scalar(base.where(Appointment.scheduled_at > now())) or 0) >= MAX_UPCOMING:
+        raise ApiError(409, "LIMIT_REACHED", f"A student can have at most {MAX_UPCOMING} upcoming appointments")
 
 
 def call(method: str, url: str, request_id: str, json=None) -> httpx.Response:
@@ -195,8 +209,26 @@ def call(method: str, url: str, request_id: str, json=None) -> httpx.Response:
         return response
 
 
-def notify_student(student_id: uuid.UUID, kind: str, appointment_id: uuid.UUID, when: datetime,
-                   doctor_name: str | None, request_id: str) -> None:
+def check_student(student_id: uuid.UUID, request_id: str) -> dict:
+    """Integration point: ask the Student service whether this student exists and is active."""
+    if not STUDENT_SERVICE_URL:
+        raise ApiError(503, "SERVICE_NOT_CONFIGURED", "STUDENT_SERVICE_URL is not configured")
+    try:
+        response = call("GET", f"{STUDENT_SERVICE_URL}/students/{student_id}", request_id)
+    except httpx.HTTPError as exc:
+        raise ApiError(503, "STUDENT_SERVICE_UNAVAILABLE", "The student service is not responding",
+                       {"request_id": request_id, "reason": type(exc).__name__})
+    if response.status_code == 404:
+        raise ApiError(422, "INVALID_STUDENT", "The student does not exist")
+    if response.status_code != 200:
+        raise ApiError(502, "STUDENT_SERVICE_ERROR", f"The student service returned status {response.status_code}")
+    student = response.json()
+    if not student.get("is_active", False):
+        raise ApiError(422, "STUDENT_INACTIVE", "The student record is inactive")
+    return student
+
+
+def notify_student(student_id: uuid.UUID, kind: str, appointment_id: uuid.UUID, when: datetime, request_id: str) -> None:
     """Background task: tell the student about a booking change. Failures never affect the booking."""
     if not (NOTIFICATION_SERVICE_URL and STUDENT_SERVICE_URL):
         return
@@ -205,61 +237,25 @@ def notify_student(student_id: uuid.UUID, kind: str, appointment_id: uuid.UUID, 
         if found.status_code != 200:
             return
         student = found.json()
-        local = when.astimezone(ZoneInfo(CLINIC_TZ)).strftime("%B %d, %Y at %I:%M %p")
-        with_doctor = f" with {doctor_name}" if doctor_name else ""
-        subject, text = {
-            "appointment_confirmed": ("Appointment confirmed", f"Your clinic appointment{with_doctor} is confirmed for {local}."),
-            "appointment_rescheduled": ("Appointment rescheduled", f"Your clinic appointment{with_doctor} was moved to {local}."),
-            "appointment_cancelled": ("Appointment cancelled", f"Your clinic appointment{with_doctor} on {local} was cancelled."),
+        local = when.astimezone(TZ).strftime("%B %d, %Y at %I:%M %p")
+        subject, message = {
+            "appointment_confirmed": ("Appointment confirmed", f"Your clinic appointment is confirmed for {local}."),
+            "appointment_rescheduled": ("Appointment rescheduled", f"Your clinic appointment was moved to {local}."),
+            "appointment_cancelled": ("Appointment cancelled", f"Your clinic appointment on {local} was cancelled."),
         }[kind]
         call("POST", f"{NOTIFICATION_SERVICE_URL}/notifications", request_id,
              json={"recipient_email": student["email"], "type": kind, "subject": subject,
-                   "body": f"Hello {student['full_name']},\n\n{text}\n\nSchool Clinic",
+                   "body": f"Hello {student['full_name']},\n\n{message}\n\nSchool Clinic",
                    "related_id": str(appointment_id)})
     except Exception as exc:
         log.warning("%s could not send %s notification: %s", request_id, kind, exc)
 
 
-def check_doctor(db: Session, doctor_id: uuid.UUID) -> Doctor:
-    doctor = db.get(Doctor, doctor_id)
-    if not doctor:
-        raise ApiError(422, "INVALID_DOCTOR", "The doctor does not exist")
-    if not doctor.is_active:
-        raise ApiError(422, "DOCTOR_INACTIVE", "The doctor is not active")
-    return doctor
-
-
-def check_slot(db: Session, doctor_id: uuid.UUID, when: datetime, exclude_id: uuid.UUID | None = None) -> None:
-    """Application-level double-booking check (the database unique index is the second line of defence)."""
-    if when <= now():
-        raise ApiError(422, "PAST_TIME", "The appointment time must be in the future")
-    window = timedelta(minutes=SLOT_MINUTES)
-    stmt = select(Appointment).where(
-        and_(
-            Appointment.doctor_id == doctor_id,
-            Appointment.status != "cancelled",
-            Appointment.scheduled_at > when - window,
-            Appointment.scheduled_at < when + window,
-        )
-    )
-    if exclude_id:
-        stmt = stmt.where(Appointment.id != exclude_id)
-    clash = db.scalars(stmt).first()
-    if clash:
-        raise ApiError(409, "DOUBLE_BOOKING", f"The doctor already has an appointment within {SLOT_MINUTES} minutes of this time",
-                       {"conflicting_appointment_id": str(clash.id), "conflicting_time": clash.scheduled_at.isoformat()})
-
-
 def commit_or_conflict(db: Session) -> None:
     try:
         db.commit()
-    except IntegrityError as exc:
+    except IntegrityError:
         db.rollback()
-        text = str(exc.orig)
-        if "uq_doctor_slot" in text:
-            raise ApiError(409, "DOUBLE_BOOKING", "The doctor was just booked for this time")
-        if "email" in text:
-            raise ApiError(409, "CONFLICT", "A doctor with this email already exists")
         raise ApiError(409, "CONFLICT", "The change conflicts with existing data")
 
 
@@ -270,123 +266,130 @@ def get_appointment(db: Session, appointment_id: uuid.UUID) -> Appointment:
     return appointment
 
 
-def request_id_of(request: Request) -> str:
-    return request.headers.get("x-request-id", str(uuid.uuid4()))
+def ensure_access(appointment: Appointment, actor: Actor) -> None:
+    """A student may only touch their own appointments."""
+    if actor.role == "student" and (actor.student_id is None or actor.student_id != appointment.student_id):
+        raise ApiError(403, "FORBIDDEN", "Students can only manage their own appointments")
 
 
-# ---------- health ----------
+# ---------- endpoints ----------
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "appointments"}
 
 
-# ---------- doctors ----------
-@app.post("/doctors", response_model=DoctorOut, status_code=201)
-def create_doctor(payload: DoctorCreate, db: Session = Depends(get_db)):
-    doctor = Doctor(**payload.model_dump())
-    db.add(doctor)
-    commit_or_conflict(db)
-    db.refresh(doctor)
-    return doctor
+@app.get("/appointments/availability", response_model=AvailabilityOut)
+def availability(day: date = Query(alias="date"), db: Session = Depends(get_db)):
+    """Which times can still be booked on a given day."""
+    if day.weekday() not in CLINIC_DAYS:
+        return AvailabilityOut(day=day, closed=True, message="The clinic is closed on this day.", slots=[])
+    start = datetime.combine(day, OPEN_TIME, tzinfo=TZ)
+    end = datetime.combine(day, CLOSE_TIME, tzinfo=TZ)
+    rows = db.execute(
+        select(Appointment.scheduled_at, func.count())
+        .where(Appointment.status != "cancelled", Appointment.scheduled_at >= start, Appointment.scheduled_at < end)
+        .group_by(Appointment.scheduled_at)
+    ).all()
+    counts = {when: n for when, n in rows}
+    slots: list[SlotOut] = []
+    current = start
+    while current + timedelta(minutes=SLOT_MINUTES) <= end:
+        remaining = max(0, SLOT_CAPACITY - counts.get(current, 0))
+        slots.append(SlotOut(start=current, label=current.strftime("%I:%M %p").lstrip("0"),
+                             available=remaining > 0 and current > now(), remaining=remaining))
+        current += timedelta(minutes=SLOT_MINUTES)
+    return AvailabilityOut(day=day, closed=False, message=None, slots=slots)
 
 
-@app.get("/doctors", response_model=list[DoctorOut])
-def list_doctors(active_only: bool = True, db: Session = Depends(get_db)):
-    stmt = select(Doctor).order_by(Doctor.full_name)
-    if active_only:
-        stmt = stmt.where(Doctor.is_active.is_(True))
-    return db.scalars(stmt).all()
-
-
-@app.get("/doctors/{doctor_id}", response_model=DoctorOut)
-def get_doctor(doctor_id: uuid.UUID, db: Session = Depends(get_db)):
-    doctor = db.get(Doctor, doctor_id)
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor not found")
-    return doctor
-
-
-@app.put("/doctors/{doctor_id}", response_model=DoctorOut)
-def update_doctor(doctor_id: uuid.UUID, payload: DoctorUpdate, db: Session = Depends(get_db)):
-    doctor = db.get(Doctor, doctor_id)
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor not found")
-    for field, value in payload.model_dump(exclude_unset=True).items():
-        setattr(doctor, field, value)
-    commit_or_conflict(db)
-    db.refresh(doctor)
-    return doctor
-
-
-# ---------- appointments ----------
 @app.post("/appointments", response_model=AppointmentOut, status_code=201)
 def create_appointment(payload: AppointmentCreate, request: Request, background_tasks: BackgroundTasks,
                        db: Session = Depends(get_db)):
     request_id = request_id_of(request)
+    actor = actor_of(request)
+    if actor.role == "student" and actor.student_id != payload.student_id:
+        raise ApiError(403, "FORBIDDEN", "Students can only book appointments for themselves")
     when = aware(payload.scheduled_at)
-    doctor = check_doctor(db, payload.doctor_id)
-    check_student(payload.student_id, request_id)
-    check_slot(db, payload.doctor_id, when)
-    appointment = Appointment(student_id=payload.student_id, doctor_id=payload.doctor_id,
-                              scheduled_at=when, reason=payload.reason)
+    if when <= now():
+        raise ApiError(422, "PAST_TIME", "The appointment time must be in the future")
+    check_clinic_hours(when)
+    check_student(payload.student_id, request_id)   # network call first, so no lock is held while waiting
+    lock_slot(db, when)
+    check_capacity(db, when)
+    check_student_limits(db, payload.student_id, when)
+    appointment = Appointment(student_id=payload.student_id, scheduled_at=when, reason=payload.reason)
     db.add(appointment)
     commit_or_conflict(db)
     db.refresh(appointment)
     background_tasks.add_task(notify_student, appointment.student_id, "appointment_confirmed", appointment.id,
-                              appointment.scheduled_at, doctor.full_name, request_id)
+                              appointment.scheduled_at, request_id)
     return appointment
 
 
 @app.get("/appointments", response_model=list[AppointmentOut])
 def list_appointments(
+    request: Request,
     student_id: uuid.UUID | None = None,
-    doctor_id: uuid.UUID | None = None,
     status: str | None = Query(default=None, pattern="^(scheduled|completed|cancelled)$"),
+    on_date: date | None = None,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ):
+    actor = actor_of(request)
+    if actor.role == "student":
+        if actor.student_id is None:
+            raise ApiError(403, "FORBIDDEN", "This account is not linked to a student record")
+        student_id = actor.student_id
     stmt = select(Appointment)
     if student_id:
         stmt = stmt.where(Appointment.student_id == student_id)
-    if doctor_id:
-        stmt = stmt.where(Appointment.doctor_id == doctor_id)
     if status:
         stmt = stmt.where(Appointment.status == status)
+    if on_date:
+        day_start = datetime.combine(on_date, dtime.min, tzinfo=TZ)
+        stmt = stmt.where(Appointment.scheduled_at >= day_start, Appointment.scheduled_at < day_start + timedelta(days=1))
     return db.scalars(stmt.order_by(Appointment.scheduled_at).limit(limit).offset(offset)).all()
 
 
 @app.get("/appointments/{appointment_id}", response_model=AppointmentOut)
-def read_appointment(appointment_id: uuid.UUID, db: Session = Depends(get_db)):
-    return get_appointment(db, appointment_id)
+def read_appointment(appointment_id: uuid.UUID, request: Request, db: Session = Depends(get_db)):
+    appointment = get_appointment(db, appointment_id)
+    ensure_access(appointment, actor_of(request))
+    return appointment
 
 
 @app.put("/appointments/{appointment_id}", response_model=AppointmentOut)
 def reschedule_appointment(appointment_id: uuid.UUID, payload: AppointmentUpdate, request: Request,
                            background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    if actor_of(request).role == "student":
+        raise ApiError(403, "FORBIDDEN", "Students cannot reschedule. Please cancel and book a new time.")
     appointment = get_appointment(db, appointment_id)
     if appointment.status != "scheduled":
         raise ApiError(409, "INVALID_STATE", f"A {appointment.status} appointment cannot be changed")
     data = payload.model_dump(exclude_unset=True)
+    moved = False
     if data.get("scheduled_at"):
         when = aware(data["scheduled_at"])
-        check_doctor(db, appointment.doctor_id)
-        check_slot(db, appointment.doctor_id, when, exclude_id=appointment.id)
+        if when <= now():
+            raise ApiError(422, "PAST_TIME", "The appointment time must be in the future")
+        check_clinic_hours(when)
+        lock_slot(db, when)
+        check_capacity(db, when, exclude_id=appointment.id)
+        check_student_limits(db, appointment.student_id, when, exclude_id=appointment.id, limit_upcoming=False)
         appointment.scheduled_at = when
+        moved = True
     if "reason" in data:
         appointment.reason = data["reason"]
     appointment.updated_at = now()
     commit_or_conflict(db)
     db.refresh(appointment)
-    if data.get("scheduled_at"):
-        doctor = db.get(Doctor, appointment.doctor_id)
+    if moved:
         background_tasks.add_task(notify_student, appointment.student_id, "appointment_rescheduled", appointment.id,
-                                  appointment.scheduled_at, doctor.full_name if doctor else None, request_id_of(request))
+                                  appointment.scheduled_at, request_id_of(request))
     return appointment
 
 
-def change_status(db: Session, appointment_id: uuid.UUID, new_status: str) -> Appointment:
-    appointment = get_appointment(db, appointment_id)
+def change_status(db: Session, appointment: Appointment, new_status: str) -> Appointment:
     if appointment.status != "scheduled":
         raise ApiError(409, "INVALID_STATE", f"A {appointment.status} appointment cannot be set to {new_status}")
     appointment.status = new_status
@@ -399,13 +402,15 @@ def change_status(db: Session, appointment_id: uuid.UUID, new_status: str) -> Ap
 @app.patch("/appointments/{appointment_id}/cancel", response_model=AppointmentOut)
 def cancel_appointment(appointment_id: uuid.UUID, request: Request, background_tasks: BackgroundTasks,
                        db: Session = Depends(get_db)):
-    appointment = change_status(db, appointment_id, "cancelled")
-    doctor = db.get(Doctor, appointment.doctor_id)
+    appointment = get_appointment(db, appointment_id)
+    ensure_access(appointment, actor_of(request))
+    appointment = change_status(db, appointment, "cancelled")
     background_tasks.add_task(notify_student, appointment.student_id, "appointment_cancelled", appointment.id,
-                              appointment.scheduled_at, doctor.full_name if doctor else None, request_id_of(request))
+                              appointment.scheduled_at, request_id_of(request))
     return appointment
 
 
 @app.patch("/appointments/{appointment_id}/complete", response_model=AppointmentOut)
 def complete_appointment(appointment_id: uuid.UUID, db: Session = Depends(get_db)):
-    return change_status(db, appointment_id, "completed")
+    """Internal: called by the Consultation service when a visit is finished."""
+    return change_status(db, get_appointment(db, appointment_id), "completed")

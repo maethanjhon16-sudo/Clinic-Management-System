@@ -1,21 +1,31 @@
 export const API: string = (import.meta.env.VITE_API_URL as string | undefined) ?? "";
 
-export type Role = "admin" | "doctor" | "nurse" | "student";
+export type Role = "admin" | "nurse" | "student";
 export interface User { id: string; email: string; full_name: string; role: Role; student_id: string | null; is_active: boolean }
 export interface Student { id: string; student_number: string; full_name: string; email: string; program: string | null; year_level: number | null; contact_number: string | null; is_active: boolean }
-export interface Doctor { id: string; full_name: string; specialization: string | null; email: string | null; is_active: boolean }
-export interface Appointment { id: string; student_id: string; doctor_id: string; scheduled_at: string; reason: string | null; status: "scheduled" | "completed" | "cancelled" }
-export interface Medicine { id: string; name: string; unit: string | null; stock: number; reorder_level: number; expiry_date: string | null; low_stock: boolean; expired: boolean }
+export interface Appointment { id: string; student_id: string; scheduled_at: string; reason: string | null; status: "scheduled" | "completed" | "cancelled" }
+export interface Slot { start: string; label: string; available: boolean; remaining: number }
+export interface Availability { day: string; closed: boolean; message: string | null; slots: Slot[] }
+export interface Medicine { id: string; name: string; unit: string | null; stock: number; reorder_level: number; expiry_date: string | null; treats: string | null; low_stock: boolean; expired: boolean }
+export interface Instructor { id: string; full_name: string; email: string; department: string | null; is_active: boolean }
+export interface Suggestion { medicine_id: string; name: string; unit: string | null; stock: number }
+export interface Inquiry {
+  id: string; student_id: string; symptoms: string[]; details: string | null;
+  status: "pending" | "ready" | "unavailable" | "collected" | "cancelled";
+  medicine_id: string | null; medicine_name: string | null; quantity: number | null; pickup_date: string | null;
+  response_note: string | null; handled_by_name: string | null; fit_for_class: boolean | null; rest_days: number | null;
+  excuse_slip_id: string | null; excuse_error: string | null; created_at: string; updated_at: string; suggestions: Suggestion[];
+}
 export interface FollowUp { target: string; status: string; attempts: number; last_error: string | null }
 export interface Consultation {
-  id: string; appointment_id: string; student_id: string; doctor_id: string; notes: string | null;
+  id: string; appointment_id: string; student_id: string; attended_by_name: string | null; notes: string | null;
   needs_excuse: boolean; rest_days: number | null; completed_at: string;
   prescriptions: { id: string; medicine_id: string; quantity: number; instructions: string | null }[];
   events: FollowUp[]; integration_status: string;
 }
 export interface Dispensing { id: string; prescription_id: string; consultation_id: string | null; student_id: string | null; medicine_id: string; quantity: number; status: string; created_at: string }
 export interface Slip {
-  id: string; consultation_id: string; student_id: string; token: string; valid_from: string; valid_until: string;
+  id: string; consultation_id: string | null; inquiry_id: string | null; student_id: string; token: string; valid_from: string; valid_until: string;
   status: string; effective_status: string; issued_at: string; revoked_at: string | null; revoke_reason: string | null;
   student_notified: boolean; recipients: { id: string; instructor_name: string; instructor_email: string }[];
 }
